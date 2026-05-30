@@ -131,7 +131,6 @@ class PostgreSQLAdapter(DBAdapter):
     def get_tables(self, table_filter: list[str] = None) -> list[TableInfo]:
         cur = self.conn.cursor()
         if table_filter:
-            # table_filter: ["schema.table", ...]
             tables = []
             for ft in table_filter:
                 parts = ft.split(".", 1)
@@ -140,32 +139,37 @@ class PostgreSQLAdapter(DBAdapter):
                 else:
                     schema, table = "public", parts[0]
                 cur.execute("""
-                    SELECT table_schema, table_name, table_type
-                    FROM information_schema.tables
-                    WHERE table_schema = %s AND table_name = %s
+                    SELECT t.table_schema, t.table_name, t.table_type,
+                           pg_catalog.obj_description(
+                             (quote_ident(t.table_schema) || '.' || quote_ident(t.table_name))::regclass::oid,
+                             'pg_class'
+                           ) AS table_comment
+                    FROM information_schema.tables t
+                    WHERE t.table_schema = %s AND t.table_name = %s
                 """, (schema, table))
                 row = cur.fetchone()
                 if row:
-                    comment = self._get_table_comment(row[0], row[1])
                     tables.append(TableInfo(
                         schema_name=row[0], table_name=row[1],
-                        table_type=row[2], description=comment
+                        table_type=row[2], description=row[3]
                     ))
             cur.close()
             return tables
         cur.execute("""
-            SELECT table_schema, table_name, table_type
-            FROM information_schema.tables
-            WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-            ORDER BY table_schema, table_name
+            SELECT t.table_schema, t.table_name, t.table_type,
+                   pg_catalog.obj_description(
+                     (quote_ident(t.table_schema) || '.' || quote_ident(t.table_name))::regclass::oid,
+                     'pg_class'
+                   ) AS table_comment
+            FROM information_schema.tables t
+            WHERE t.table_schema NOT IN ('pg_catalog', 'information_schema')
+            ORDER BY t.table_schema, t.table_name
         """)
         tables = []
         for row in cur.fetchall():
-            # 설명 가져오기
-            comment = self._get_table_comment(row[0], row[1])
             tables.append(TableInfo(
                 schema_name=row[0], table_name=row[1],
-                table_type=row[2], description=comment
+                table_type=row[2], description=row[3]
             ))
         cur.close()
         return tables
@@ -530,6 +534,12 @@ class MetadataStore:
                 collected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 duration_seconds REAL
             );
+            CREATE TABLE IF NOT EXISTS table_presets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                tables TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
         """)
         self.conn.commit()
 
@@ -591,6 +601,33 @@ class MetadataStore:
                 (source_column_id, target_column_id, relation_type, confidence, detected_by)
             VALUES (?, ?, ?, ?, ?)
         """, (source_id, target_id, relation_type, confidence, detected_by))
+        self.conn.commit()
+
+    # ── 테이블 프리셋 관리 ─────────────────────────────
+
+    def save_preset(self, name: str, tables: list[str]) -> int:
+        cur = self.conn.cursor()
+        cur.execute("INSERT INTO table_presets (name, tables) VALUES (?, ?)",
+                     (name, json.dumps(tables)))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def list_presets(self) -> list[dict]:
+        cur = self.conn.cursor()
+        cur.execute("SELECT id, name, created_at FROM table_presets ORDER BY created_at DESC")
+        return [{"id": r[0], "name": r[1], "created_at": r[2]} for r in cur.fetchall()]
+
+    def load_preset(self, preset_id: int) -> list[str]:
+        cur = self.conn.cursor()
+        cur.execute("SELECT tables FROM table_presets WHERE id = ?", (preset_id,))
+        row = cur.fetchone()
+        if not row:
+            return []
+        return json.loads(row[0])
+
+    def delete_preset(self, preset_id: int):
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM table_presets WHERE id = ?", (preset_id,))
         self.conn.commit()
 
     def close(self):

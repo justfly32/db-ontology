@@ -176,12 +176,56 @@ class NamingPatternAnalyzer:
                     ))
         return relationships
 
+    def find_comment_matches(self, all_columns: list[dict]) -> list[Relationship]:
+        """컬럼 코멘트(description) 기반 유사도 매칭"""
+        has_comment = [c for c in all_columns if c.get("description")]
+        if len(has_comment) < 2:
+            return []
+
+        def tokenize(text: str) -> set:
+            import re
+            tokens = re.sub(r"[^\w가-힣\s]", " ", str(text).lower()).split()
+            return {t for t in tokens if len(t) > 1}
+
+        relationships = []
+        seen = set()
+        for i in range(len(has_comment)):
+            for j in range(i + 1, len(has_comment)):
+                c1, c2 = has_comment[i], has_comment[j]
+                pair = (c1["id"], c2["id"])
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                seen.add((c2["id"], c1["id"]))
+
+                tok1 = tokenize(c1["description"])
+                tok2 = tokenize(c2["description"])
+                if not tok1 or not tok2:
+                    continue
+
+                inter = tok1 & tok2
+                jaccard = len(inter) / len(tok1 | tok2) if tok1 | tok2 else 0
+                if jaccard < 0.3:
+                    continue
+
+                relationships.append(Relationship(
+                    source_db=c1["database"], source_schema=c1["schema"],
+                    source_table=c1["table"], source_column=c1["column_name"],
+                    target_db=c2["database"], target_schema=c2["schema"],
+                    target_table=c2["table"], target_column=c2["column_name"],
+                    relation_type="COMMENT_MATCH", confidence=min(0.85, jaccard + 0.3),
+                    detected_by="NamingPattern",
+                    evidence=f"코멘트 유사: {jaccard:.0%} | {' '.join(inter)[:60]}"
+                ))
+        return relationships
+
     def find_all(self, all_columns: list[dict]) -> list[Relationship]:
         """모든 명명 패턴 관계 탐지"""
         results = []
         results.extend(self.find_exact_matches(all_columns))
         results.extend(self.find_normalized_matches(all_columns))
         results.extend(self.find_synonym_matches(all_columns))
+        results.extend(self.find_comment_matches(all_columns))
         return results
 
 
@@ -269,6 +313,72 @@ class DataSimilarityAnalyzer:
             factors.append("unique_ratio_similar")
 
         return {"score": score, "factors": factors}
+
+    def fk_validation_by_values(
+        self,
+        candidates: list[Relationship],
+        db_config: dict,
+        min_overlap_pct: float = 0.5,
+    ) -> list[Relationship]:
+        """실제 데이터 값 교집합으로 관계 검증 (PostgreSQL)
+        candidates: 검증할 관계 후보 목록
+        db_config: {"host", "port", "dbname", "user", "password"}
+        min_overlap_pct: 최소 overlap 비율 (기본 50%)
+        """
+        import psycopg2
+        validated = []
+        conn = psycopg2.connect(**db_config)
+        cur = conn.cursor()
+
+        for rel in candidates:
+            try:
+                src_full = f"{rel.source_schema}.{rel.source_table}"
+                tgt_full = f"{rel.target_schema}.{rel.target_table}"
+
+                qi = lambda s: f'"{s.replace("\"", "\"\"")}"'
+                src_qi = f"{qi(rel.source_schema)}.{qi(rel.source_table)}"
+                tgt_qi = f"{qi(rel.target_schema)}.{qi(rel.target_table)}"
+
+                src_col = qi(rel.source_column)
+                tgt_col = qi(rel.target_column)
+
+                # overlap count
+                cur.execute(f"""
+                    SELECT COUNT(*) FROM {src_qi} s
+                    WHERE s.{src_col} IS NOT NULL
+                      AND EXISTS (
+                        SELECT 1 FROM {tgt_qi} t
+                        WHERE t.{tgt_col} = s.{src_col}
+                      )
+                """)
+                overlap = cur.fetchone()[0]
+
+                cur.execute(f"SELECT COUNT(*) FROM {src_qi} WHERE {src_col} IS NOT NULL")
+                src_total = cur.fetchone()[0]
+
+                cur.execute(f"SELECT COUNT(*) FROM {tgt_qi} WHERE {tgt_col} IS NOT NULL")
+                tgt_total = cur.fetchone()[0]
+
+                src_pct = overlap / src_total if src_total > 0 else 0
+                tgt_pct = overlap / tgt_total if tgt_total > 0 else 0
+                avg_pct = (src_pct + tgt_pct) / 2
+
+                if avg_pct >= min_overlap_pct:
+                    validated.append(Relationship(
+                        source_db=rel.source_db, source_schema=rel.source_schema,
+                        source_table=rel.source_table, source_column=rel.source_column,
+                        target_db=rel.target_db, target_schema=rel.target_schema,
+                        target_table=rel.target_table, target_column=rel.target_column,
+                        relation_type="DATA_SIMILAR", confidence=min(0.95, avg_pct),
+                        detected_by="DataSimilarity",
+                        evidence=f"값 중복: src={overlap}/{src_total}({src_pct:.0%}) tgt={overlap}/{tgt_total}({tgt_pct:.0%})"
+                    ))
+            except Exception as e:
+                continue
+
+        cur.close()
+        conn.close()
+        return validated
 
 
 # ── 3. FK/인덱스 기반 관계 탐지기 ───────────────────────

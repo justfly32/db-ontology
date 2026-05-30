@@ -1,6 +1,6 @@
 """
 DB Ontology Analyzer - PostgreSQL 엔트리포인트
-CLI 테이블 선택 → 수집 → 분석 → 그래프 → 대시보드
+프리셋/CLI 테이블 선택 → 수집 → 분석 → 값 검증 → 그래프 → 대시보드
 """
 
 import os
@@ -21,23 +21,59 @@ from collector.drift_detector import SchemaDriftDetector
 from visualizer.dashboard import DashboardHTMLBuilder, DashboardDataProvider
 
 
+META_PATH = os.path.expanduser("~/.hermes/data/ontology_pg.db")
+OUTPUT_DIR = os.path.expanduser("~/coding_projects/db-ontology/output")
+
+
 def fetch_all_tables(host, port, dbname, user, password) -> list[dict]:
-    """PostgreSQL에서 전체 테이블 목록 조회 (schema.table)"""
+    """PostgreSQL에서 전체 테이블 목록 조회 (schema.table, 한글 코멘트 포함)"""
     import psycopg2
     conn = psycopg2.connect(
         host=host, port=port, database=dbname, user=user, password=password
     )
     cur = conn.cursor()
     cur.execute("""
-        SELECT table_schema, table_name
-        FROM information_schema.tables
-        WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-        ORDER BY table_schema, table_name
+        SELECT t.table_schema, t.table_name,
+               pg_catalog.obj_description(
+                 (quote_ident(t.table_schema) || '.' || quote_ident(t.table_name))::regclass::oid,
+                 'pg_class'
+               ) AS table_comment
+        FROM information_schema.tables t
+        WHERE t.table_schema NOT IN ('pg_catalog', 'information_schema')
+        ORDER BY t.table_schema, t.table_name
     """)
-    rows = [{"schema": r[0], "table": r[1]} for r in cur.fetchall()]
+    rows = [{"schema": r[0], "table": r[1], "comment": r[2]} for r in cur.fetchall()]
     cur.close()
     conn.close()
     return rows
+
+
+def show_preset_menu(store: MetadataStore) -> list[str] | None:
+    """프리셋 불러오기 메뉴. None이면 새로 선택"""
+    presets = store.list_presets()
+    if not presets:
+        return None
+
+    print("\n📁 저장된 프리셋 목록")
+    print("─" * 40)
+    for i, p in enumerate(presets, 1):
+        tables = store.load_preset(p["id"])
+        print(f"  {i}: {p['name']} ({len(tables)}개 테이블)")
+    print("  0: 새로 선택")
+    print("─" * 40)
+
+    raw = input("  선택: ").strip()
+    try:
+        n = int(raw)
+        if n == 0:
+            return None
+        if 1 <= n <= len(presets):
+            selected = store.load_preset(presets[n - 1]["id"])
+            print(f"  ✅ 프리셋 불러옴: {presets[n - 1]['name']} ({len(selected)}개)")
+            return selected
+    except ValueError:
+        pass
+    return None
 
 
 def show_table_selection(tables: list[dict]) -> list[str]:
@@ -55,7 +91,8 @@ def show_table_selection(tables: list[dict]) -> list[str]:
         print(f"  ── {schema} ──")
         for t in tbls:
             label = f"{schema}.{t['table']}"
-            print(f"    {idx:>4}: {t['table']}")
+            comment = f" — {t['comment']}" if t.get("comment") else ""
+            print(f"    {idx:>4}: {t['table']}{comment}")
             index_map[idx] = label
             idx += 1
 
@@ -92,6 +129,17 @@ def show_table_selection(tables: list[dict]) -> list[str]:
         print("  ⚠️ 올바른 번호를 입력하세요.")
 
 
+def ask_save_preset(store: MetadataStore, selected: list[str]):
+    """프리셋 저장 여부 확인"""
+    raw = input("\n💾 현재 선택을 프리셋으로 저장할까요? (y/n): ").strip().lower()
+    if raw != "y":
+        return
+    name = input("  프리셋 이름: ").strip()
+    if name:
+        store.save_preset(name, selected)
+        print(f"  ✅ 프리셋 저장됨: {name}")
+
+
 def main():
     """전체 파이프라인 실행"""
     print("=" * 60)
@@ -99,7 +147,7 @@ def main():
     print(f"   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
 
-    # DB 접속 정보 (비밀키는 환경변수로 별도 주입)
+    # DB 접속 정보
     db_config = {
         "host": os.getenv("DB_HOST", "localhost"),
         "port": int(os.getenv("DB_PORT", "5432")),
@@ -110,7 +158,6 @@ def main():
 
     if not db_config["password"]:
         print("❌ DB_PASSWORD 환경변수가 설정되지 않았습니다.")
-        print("   export DB_PASSWORD=... 또는 Docker secret/k8s secret으로 주입하세요.")
         sys.exit(1)
 
     print(f"\n🔗 연결 대상: {db_config['host']}:{db_config['port']}/{db_config['dbname']}")
@@ -120,21 +167,20 @@ def main():
     all_tables = fetch_all_tables(**db_config)
     print(f"   ✅ {len(all_tables)}개 테이블 발견")
 
-    # CLI 테이블 선택
-    selected = show_table_selection(all_tables)
+    # 저장소 초기화 (기존 데이터 유지)
+    os.makedirs(os.path.dirname(META_PATH), exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    store = MetadataStore(db_path=META_PATH)
+
+    # 프리셋 메뉴 또는 새 선택
+    selected = show_preset_menu(store)
+    if selected is None:
+        selected = show_table_selection(all_tables)
+        ask_save_preset(store, selected)
+
     print(f"   ✅ 선택됨: {len(selected)}개 테이블")
     for s in selected:
         print(f"      - {s}")
-
-    # 초기화
-    meta_path = os.path.expanduser("~/.hermes/data/ontology_pg.db")
-    output_dir = os.path.expanduser("~/coding_projects/db-ontology/output")
-    os.makedirs(os.path.dirname(meta_path), exist_ok=True)
-    os.makedirs(output_dir, exist_ok=True)
-    if os.path.exists(meta_path):
-        os.remove(meta_path)
-
-    store = MetadataStore(db_path=meta_path)
 
     # Phase 1: 스키마 수집 (선택된 테이블만)
     print("\n📡 [Phase 1] 스키마 수집")
@@ -159,10 +205,35 @@ def main():
         store.close()
         return
 
-    # Phase 2: 연관관계 분석
+    # Phase 2: 연관관계 분석 (FK + 명명패턴 + 코멘트 + 동의어)
     print("\n🔍 [Phase 2] 연관관계 분석")
     orchestrator = RelationshipOrchestrator(store)
     rels = orchestrator.analyze_all()
+
+    # Phase 2b: 값 기반 관계 검증 (FK가 없는 경우 보완)
+    if rels:
+        print("\n🔎 [Phase 2b] 값 기반 관계 검증")
+        from analyzer.relationship_analyzer import DataSimilarityAnalyzer
+        data_analyzer = DataSimilarityAnalyzer()
+        value_rels = data_analyzer.fk_validation_by_values(
+            candidates=rels,
+            db_config=db_config,
+            min_overlap_pct=0.5,
+        )
+        if value_rels:
+            existing_types = {r.relation_type for r in rels}
+            for vr in value_rels:
+                if "DATA_SIMILAR" not in existing_types:
+                    rels.append(vr)
+                    store.save_relationship(
+                        source_id=0, target_id=0,
+                        relation_type=vr.relation_type,
+                        confidence=vr.confidence,
+                        detected_by=vr.detected_by,
+                    )
+            print(f"  ✅ 값 검증 완료: {len(value_rels)}개 관계 확인")
+        else:
+            print(f"  값 검증: 유효한 관계 없음")
 
     # Phase 3: 온톨로지 그래프 구축
     print("\n🕸️ [Phase 3] 온톨로지 그래프 구축")
@@ -174,27 +245,30 @@ def main():
 
     # Phase 4: 시각화 대시보드
     print("\n📊 [Phase 4] 대시보드 생성")
-    provider = DashboardDataProvider(meta_path)
+    provider = DashboardDataProvider(META_PATH)
     d3_data = ont_graph.to_d3_json()
     builder = DashboardHTMLBuilder(provider, d3_data)
-    builder.build_full_dashboard(f"{output_dir}/dashboard.html")
-    ont_graph.save_html_visualization(f"{output_dir}/ontology_graph.html")
-    ont_graph.export_graphml(f"{output_dir}/ontology.graphml")
+    builder.build_full_dashboard(f"{OUTPUT_DIR}/dashboard.html")
+    ont_graph.save_html_visualization(f"{OUTPUT_DIR}/ontology_graph.html")
+    ont_graph.export_graphml(f"{OUTPUT_DIR}/ontology.graphml")
 
     # Phase 5: 스키마 드리프트 감지
     print("\n🔄 [Phase 5] 스키마 드리프트 감지")
-    detector = SchemaDriftDetector(meta_path)
+    detector = SchemaDriftDetector(META_PATH)
     detector.take_snapshot()
     drift = detector.detect_changes()
     print(f"  스키마 상태: {drift['status']}")
+    if drift.get("changes"):
+        for c in drift["changes"][:5]:
+            print(f"    [{c['type']}] {c['target']}")
 
     # 요약
     print("\n" + "=" * 60)
     print("✅ 전체 파이프라인 완료")
-    print(f"  메타데이터: {meta_path}")
-    print(f"  대시보드:   {output_dir}/dashboard.html")
-    print(f"  그래프:     {output_dir}/ontology_graph.html")
-    print(f"  GraphML:    {output_dir}/ontology.graphml")
+    print(f"  메타데이터: {META_PATH}")
+    print(f"  대시보드:   {OUTPUT_DIR}/dashboard.html")
+    print(f"  그래프:     {OUTPUT_DIR}/ontology_graph.html")
+    print(f"  GraphML:    {OUTPUT_DIR}/ontology.graphml")
     print("=" * 60)
 
     store.close()
