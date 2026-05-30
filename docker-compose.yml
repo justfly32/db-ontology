@@ -1,0 +1,85 @@
+# ============================================================
+# docker-compose.yml — DB Ontology Stack
+# ============================================================
+version: "3.9"
+
+services:
+  # ── Ontology API Server ──────────────────────────────
+  ontology-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: db-ontology-api
+    ports:
+      - "8000:8000"
+    environment:
+      - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-change-me-please}
+      - DATABASE_URL=sqlite:///data/ontology.db
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+      - LOG_LEVEL=INFO
+    volumes:
+      - ontology-data:/app/data
+      - ontology-output:/app/output
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - ontology-net
+
+  # ── (선택) PostgreSQL 대상 DB ────────────────────────
+  # 실제 분석 대상 DB를 Docker로 운영하는 경우
+  # sample-db:
+  #   image: postgres:16-alpine
+  #   container_name: ontology-target-pg
+  #   environment:
+  #     POSTGRES_DB: sample
+  #     POSTGRES_USER: admin
+  #     POSTGRES_PASSWORD: secret
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - pg-data:/var/lib/postgresql/data
+  #   networks:
+  #     - ontology-net
+
+  # ── (선택) Redis ─ 토큰 폐기 저장소 (운영) ─────────────
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: ontology-redis
+  #   ports:
+  #     - "6379:6379"
+  #   networks:
+  #     - ontology-net
+
+  # ── (선택) Nginx 리버스 프록시 ────────────────────────
+  # nginx:
+  #   image: nginx:alpine
+  #   container_name: ontology-nginx
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./nginx.conf:/etc/nginx/nginx.conf:ro
+  #     - ./certs:/etc/nginx/certs:ro
+  #   depends_on:
+  #     - ontology-api
+  #   networks:
+  #     - ontology-net
+
+volumes:
+  ontology-data:
+    driver: local
+  ontology-output:
+    driver: local
+  # pg-data:
+  #   driver: local
+
+networks:
+  ontology-net:
+    driver: bridge

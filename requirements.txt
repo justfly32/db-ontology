@@ -1,0 +1,19 @@
+# Core
+fastapi>=0.110
+uvicorn[standard]>=0.29
+httpx>=0.27
+pydantic>=2.0
+
+# Database
+# psycopg2-binary>=2.9   # PostgreSQL (필요시 주석 해제)
+# PyMySQL>=1.1            # MySQL (필시 주석 해제)
+
+# Graph/Analysis
+networkx>=3.0
+
+# NLP/LLM
+# openai>=1.0             # LLM 의미 분석 (필요시 주석 해제)
+
+# Utils
+python-dotenv>=1.0
+python-multipart>=0.0.6

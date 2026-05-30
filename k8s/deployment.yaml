@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db-ontology-api
+  namespace: db-ontology
+  labels:
+    app: db-ontology-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: db-ontology-api
+  template:
+    metadata:
+      labels:
+        app: db-ontology-api
+    spec:
+      containers:
+        - name: api
+          image: db-ontology:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              protocol: TCP
+          env:
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ontology-secrets
+                  key: JWT_SECRET
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ontology-secrets
+                  key: ADMIN_PASSWORD
+            - name: LOG_LEVEL
+              value: "INFO"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+            - name: output
+              mountPath: /app/output
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: ontology-data-pvc
+        - name: output
+          persistentVolumeClaim:
+            claimName: ontology-output-pvc
