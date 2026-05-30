@@ -69,7 +69,7 @@ class DBAdapter(ABC):
         ...
 
     @abstractmethod
-    def get_tables(self) -> list[TableInfo]:
+    def get_tables(self, table_filter: list[str] = None) -> list[TableInfo]:
         ...
 
     @abstractmethod
@@ -84,13 +84,13 @@ class DBAdapter(ABC):
     def get_sample_data(self, schema: str, table: str, column: str, limit: int = 100) -> list:
         ...
 
-    def collect_all(self) -> DatabaseInfo:
-        """전체 스키마 수집"""
+    def collect_all(self, table_filter: list[str] = None) -> DatabaseInfo:
+        """전체 스키마 수집 (table_filter: ['schema.table', ...] 형태)"""
         db_info = DatabaseInfo(
             name=self.db_name,
             db_type=self.__class__.__name__.replace("Adapter", "").lower(),
         )
-        tables = self.get_tables()
+        tables = self.get_tables(table_filter)
         for table in tables:
             table.columns = self.get_columns(table.schema_name, table.table_name)
             fks = self.get_foreign_keys(table.schema_name, table.table_name)
@@ -128,8 +128,31 @@ class PostgreSQLAdapter(DBAdapter):
         if self.conn:
             self.conn.close()
 
-    def get_tables(self) -> list[TableInfo]:
+    def get_tables(self, table_filter: list[str] = None) -> list[TableInfo]:
         cur = self.conn.cursor()
+        if table_filter:
+            # table_filter: ["schema.table", ...]
+            tables = []
+            for ft in table_filter:
+                parts = ft.split(".", 1)
+                if len(parts) == 2:
+                    schema, table = parts
+                else:
+                    schema, table = "public", parts[0]
+                cur.execute("""
+                    SELECT table_schema, table_name, table_type
+                    FROM information_schema.tables
+                    WHERE table_schema = %s AND table_name = %s
+                """, (schema, table))
+                row = cur.fetchone()
+                if row:
+                    comment = self._get_table_comment(row[0], row[1])
+                    tables.append(TableInfo(
+                        schema_name=row[0], table_name=row[1],
+                        table_type=row[2], description=comment
+                    ))
+            cur.close()
+            return tables
         cur.execute("""
             SELECT table_schema, table_name, table_type
             FROM information_schema.tables
@@ -254,8 +277,23 @@ class MySQLAdapter(DBAdapter):
         if self.conn:
             self.conn.close()
 
-    def get_tables(self) -> list[TableInfo]:
+    def get_tables(self, table_filter: list[str] = None) -> list[TableInfo]:
         cur = self.conn.cursor()
+        if table_filter:
+            tables = []
+            for ft in table_filter:
+                parts = ft.split(".", 1)
+                table = parts[1] if len(parts) == 2 else parts[0]
+                cur.execute("""
+                    SELECT table_schema, table_name, table_type
+                    FROM information_schema.tables
+                    WHERE table_schema = %s AND table_name = %s
+                """, (self.database, table))
+                row = cur.fetchone()
+                if row:
+                    tables.append(TableInfo(schema_name=row[0], table_name=row[1], table_type=row[2]))
+            cur.close()
+            return tables
         cur.execute("""
             SELECT table_schema, table_name, table_type
             FROM information_schema.tables
@@ -333,8 +371,22 @@ class SQLiteAdapter(DBAdapter):
         if self.conn:
             self.conn.close()
 
-    def get_tables(self) -> list[TableInfo]:
+    def get_tables(self, table_filter: list[str] = None) -> list[TableInfo]:
         cur = self.conn.cursor()
+        if table_filter:
+            tables = []
+            for ft in table_filter:
+                parts = ft.split(".", 1)
+                table = parts[1] if len(parts) == 2 else parts[0]
+                cur.execute("""
+                    SELECT name FROM sqlite_master
+                    WHERE type='table' AND name = ?
+                """, (table,))
+                row = cur.fetchone()
+                if row:
+                    tables.append(TableInfo(schema_name="main", table_name=row[0]))
+            cur.close()
+            return tables
         cur.execute("""
             SELECT name FROM sqlite_master
             WHERE type='table' AND name NOT LIKE 'sqlite_%'
@@ -561,13 +613,14 @@ class SchemaCollector:
         adapter = AdapterFactory.create(db_type, **kwargs)
         self.adapters.append(adapter)
 
-    def collect_all(self) -> list[DatabaseInfo]:
+    def collect_all(self, table_filter: list[str] = None) -> list[DatabaseInfo]:
+        """table_filter: ['schema.table', ...] — 지정된 테이블만 수집"""
         results = []
         for adapter in self.adapters:
             try:
                 print(f"  📡 수집 중: {adapter.db_name} ({adapter.__class__.__name__})")
                 adapter.connect()
-                db_info = adapter.collect_all()
+                db_info = adapter.collect_all(table_filter)
                 db_id = self.store.save_database(db_info)
                 print(f"  ✅ 완료: {len(db_info.tables)}개 테이블, "
                       f"{sum(len(t.columns) for t in db_info.tables)}개 컬럼")

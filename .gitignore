@@ -9,6 +9,7 @@ env/
 *.db
 *.sqlite3
 .DS_Store
+.env
 output/*.html
 output/*.graphml
 output/*.json
