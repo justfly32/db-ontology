@@ -593,6 +593,20 @@ class MetadataStore:
             })
         return columns
 
+    def resolve_column_id(self, db_name: str, schema: str, table: str, column: str) -> int | None:
+        """description, table, column → columns.id 조회"""
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT c.id FROM columns c
+            JOIN tables t ON c.table_id = t.id
+            JOIN databases d ON t.database_id = d.id
+            WHERE d.name = ? AND t.schema_name = ?
+              AND t.table_name = ? AND c.column_name = ?
+        """, (db_name, schema, table, column))
+        row = cur.fetchone()
+        cur.close()
+        return row[0] if row else None
+
     def save_relationship(self, source_id: int, target_id: int,
                           relation_type: str, confidence: float, detected_by: str):
         cur = self.conn.cursor()

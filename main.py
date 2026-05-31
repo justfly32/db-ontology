@@ -156,9 +156,9 @@ def main():
         "password": os.getenv("DB_PASSWORD", ""),
     }
 
-    if not db_config["password"]:
-        print("❌ DB_PASSWORD 환경변수가 설정되지 않았습니다.")
-        sys.exit(1)
+    if not db_config.get("password"):
+        print("⚠️  DB_PASSWORD가 설정되지 않았습니다. 로컬 인증(peer/trust) 가정")
+        print("   (로컬 macOS PostgreSQL: peer 인증이므로 비밀번호 불필요)")
 
     print(f"\n🔗 연결 대상: {db_config['host']}:{db_config['port']}/{db_config['dbname']}")
 
@@ -222,16 +222,25 @@ def main():
         )
         if value_rels:
             existing_types = {r.relation_type for r in rels}
+            saved_count = 0
             for vr in value_rels:
                 if "DATA_SIMILAR" not in existing_types:
-                    rels.append(vr)
-                    store.save_relationship(
-                        source_id=0, target_id=0,
-                        relation_type=vr.relation_type,
-                        confidence=vr.confidence,
-                        detected_by=vr.detected_by,
-                    )
-            print(f"  ✅ 값 검증 완료: {len(value_rels)}개 관계 확인")
+                    src_id = store.resolve_column_id(
+                        vr.source_db, vr.source_schema,
+                        vr.source_table, vr.source_column)
+                    tgt_id = store.resolve_column_id(
+                        vr.target_db, vr.target_schema,
+                        vr.target_table, vr.target_column)
+                    if src_id and tgt_id:
+                        store.save_relationship(
+                            source_id=src_id, target_id=tgt_id,
+                            relation_type=vr.relation_type,
+                            confidence=vr.confidence,
+                            detected_by=vr.detected_by,
+                        )
+                        rels.append(vr)
+                        saved_count += 1
+            print(f"  ✅ 값 검증 완료: {saved_count}개 관계 저장")
         else:
             print(f"  값 검증: 유효한 관계 없음")
 
@@ -248,7 +257,13 @@ def main():
     provider = DashboardDataProvider(META_PATH)
     d3_data = ont_graph.to_d3_json()
     builder = DashboardHTMLBuilder(provider, d3_data)
-    builder.build_full_dashboard(f"{OUTPUT_DIR}/dashboard.html")
+
+    from analyzer.insight_engine import InsightEngine
+    ie = InsightEngine(store, ont_graph.graph)
+    builder.build_full_dashboard(
+        f"{OUTPUT_DIR}/dashboard.html",
+        insight_engine=ie,
+    )
     ont_graph.save_html_visualization(f"{OUTPUT_DIR}/ontology_graph.html")
     ont_graph.export_graphml(f"{OUTPUT_DIR}/ontology.graphml")
 

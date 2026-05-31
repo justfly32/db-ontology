@@ -351,8 +351,8 @@ class OntologyGraph:
         for src, tgt, attrs in self.graph.edges(data=True):
             if src in node_index and tgt in node_index:
                 links.append({
-                    "source": node_index[src],
-                    "target": node_index[tgt],
+                    "source": src,
+                    "target": tgt,
                     "type": attrs.get("type", ""),
                     "confidence": attrs.get("confidence", 1.0),
                     "value": attrs.get("width", 1),

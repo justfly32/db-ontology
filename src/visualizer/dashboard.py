@@ -10,6 +10,7 @@ from typing import Optional
 from datetime import datetime
 
 import networkx as nx
+from analyzer.insight_engine import InsightEngine
 
 
 class DashboardDataProvider:
@@ -200,6 +201,148 @@ class DashboardDataProvider:
         """)
         return [row[0] for row in cur.fetchall()]
 
+    def get_interpretation(self) -> dict:
+        """그래프 해석을 위한 구조화된 데이터"""
+        cur = self.conn.cursor()
+
+        # DB 기본 정보
+        cur.execute("SELECT name, db_type FROM databases LIMIT 1")
+        db_row = cur.fetchone()
+        db_name = db_row[0] if db_row else "Unknown"
+        db_type = db_row[1] if db_row else "Unknown"
+
+        # 스키마별 구성
+        cur.execute("""
+            SELECT t.schema_name, COUNT(t.id) as table_cnt,
+                   GROUP_CONCAT(t.table_name) as table_list
+            FROM tables t
+            GROUP BY t.schema_name
+            ORDER BY t.schema_name
+        """)
+        schemas = []
+        for r in cur.fetchall():
+            schemas.append({
+                "name": r[0], "table_count": r[1], "tables": r[2].split(","),
+            })
+
+        # 요약
+        cur.execute("SELECT COUNT(*) FROM tables")
+        total_tables = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM columns")
+        total_columns = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM relationships")
+        total_relations = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM relationships WHERE relation_type='FK'")
+        fk_count = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM relationships WHERE relation_type='DATA_SIMILAR'")
+        value_based_count = cur.fetchone()[0]
+
+        schema_desc = " · ".join(
+            f"{s['name']}({s['table_count']}개)"
+            for s in schemas
+        )
+
+        summary_desc = (
+            f"{db_name}는 {len(schemas)}개 스키마({schema_desc}), "
+            f"총 {total_tables}개 테이블, {total_columns}개 컬럼, "
+            f"{total_relations}개 관계로 구성된 데이터베이스입니다. "
+        )
+        if fk_count > 0:
+            summary_desc += (
+                f"명시적 외래키(FK)는 {fk_count}개 탐지되었고, "
+            )
+        if value_based_count > 0:
+            summary_desc += (
+                f"FK 제약 없이 실제 데이터 값 기반으로 탐지된 관계는 "
+                f"{value_based_count}개입니다."
+            )
+
+        # 주요 관계 (FK + DATA_SIMILAR, 신뢰도 상위)
+        cur.execute("""
+            SELECT r.relation_type, r.confidence,
+                   sc.column_name, st.table_name, st.schema_name,
+                   tc.column_name, tt.table_name, tt.schema_name
+            FROM relationships r
+            JOIN columns sc ON r.source_column_id = sc.id
+            JOIN tables st ON sc.table_id = st.id
+            JOIN columns tc ON r.target_column_id = tc.id
+            JOIN tables tt ON tc.table_id = tt.id
+            WHERE r.relation_type IN ('FK', 'DATA_SIMILAR')
+              AND r.confidence >= 0.7
+            ORDER BY r.confidence DESC
+            LIMIT 20
+        """)
+        key_relations = []
+        for r in cur.fetchall():
+            note = ""
+            if r[0] == "FK":
+                note = "명시적 외래키(FK) 제약조건"
+            elif r[0] == "DATA_SIMILAR":
+                note = f"값 기반 탐지 (FK 제약 없음, 신뢰도 {r[1]:.0%})"
+            key_relations.append({
+                "type": r[0], "confidence": r[1],
+                "source": f"{r[3]}.{r[2]}", "target": f"{r[6]}.{r[5]}",
+                "note": note,
+            })
+
+        # 값 기반 관계 (상세 정보)
+        cur.execute("""
+            SELECT r.confidence,
+                   sc.column_name, st.table_name, st.schema_name,
+                   tc.column_name, tt.table_name, tt.schema_name
+            FROM relationships r
+            JOIN columns sc ON r.source_column_id = sc.id
+            JOIN tables st ON sc.table_id = st.id
+            JOIN columns tc ON r.target_column_id = tc.id
+            JOIN tables tt ON tc.table_id = tt.id
+            WHERE r.relation_type = 'DATA_SIMILAR'
+            ORDER BY r.confidence DESC
+        """)
+        value_based = []
+        for r in cur.fetchall():
+            pct = f"{r[0]:.0%}"
+            value_based.append({
+                "source": f"{r[3]}.{r[1]}", "target": f"{r[6]}.{r[5]}",
+                "overlap": pct,
+                "note": f"{r[2]}.{r[1]} → {r[5]}.{r[4]} (중복률: {pct})",
+            })
+
+        # 주의사항: 다른 의미지만 값이 겹친 관계 탐지
+        warnings = []
+        suspicious_pairs = [
+            ("dept_id", "emp_id", "부서 ID와 직원 ID는 숫자 값이 겹칠 수 있지만 의미가 다름"),
+            ("item_id", "product_id", "주문 항목 ID와 상품 ID는 같은 숫자 체계일 수 있음"),
+            ("total_amount", "amount", "총 금액과 개별 금액은 의미 범위가 다름"),
+        ]
+        for r in key_relations:
+            src_col = r["source"].split(".")[-1]
+            tgt_col = r["target"].split(".")[-1]
+            for sc, tc, msg in suspicious_pairs:
+                if (sc in src_col and tc in tgt_col) or (tc in src_col and sc in tgt_col):
+                    if r["type"] != "FK":
+                        warnings.append(
+                            f"⚠️  {r['source']} ↔ {r['target']}: {msg}"
+                        )
+
+        cur.close()
+        return {
+            "summary": {
+                "db_name": db_name,
+                "db_type": db_type,
+                "total_schemas": len(schemas),
+                "total_tables": total_tables,
+                "total_columns": total_columns,
+                "total_relations": total_relations,
+                "fk_count": fk_count,
+                "value_based_count": value_based_count,
+                "description": summary_desc,
+            },
+            "schemas": schemas,
+            "key_relations": key_relations,
+            "value_based": value_based,
+            "warnings": warnings,
+        }
+
     def close(self):
         self.conn.close()
 
@@ -211,10 +354,20 @@ class DashboardHTMLBuilder:
         self.data = data_provider
         self.graph_data = graph_data
 
-    def build_full_dashboard(self, output_path: str):
+    def build_full_dashboard(self, output_path: str, insight_engine: InsightEngine = None):
         """통합 대시보드 HTML 생성"""
         overview = self.data.get_overview()
         today = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        insight_data = None
+        if insight_engine:
+            insight_data = {
+                "entities": insight_engine.detect_entities(),
+                "impactful_tables": insight_engine.find_impactful_tables(min_connections=2),
+                "quality": insight_engine.quality_report(),
+                "join_paths": insight_engine.find_all_join_paths(max_pairs=10),
+                "recommendations": insight_engine.generate_recommendations(max_results=20),
+            }
 
         html = f"""<!DOCTYPE html>
 <html lang="ko">
@@ -284,6 +437,23 @@ h3{{font-size:15px;margin-bottom:8px;color:var(--green)}}
 .path-step{{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;background:var(--surface);border-radius:6px;font-size:13px;margin:2px}}
 .path-arrow{{color:var(--muted);font-size:16px}}
 
+/* 인사이트 패널 */
+.section{{margin-bottom:20px}}
+.section-title{{font-weight:600;font-size:15px;color:var(--green);margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--border)}}
+.entity-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px}}
+.entity-card{{background:var(--surface2);border-radius:8px;padding:14px;border-left:3px solid var(--purple)}}
+.entity-name{{font-weight:600;font-size:14px;color:var(--purple);margin-bottom:4px}}
+.entity-tables{{font-size:12px;color:var(--muted);line-height:1.6}}
+.entity-count{{font-size:11px;color:var(--muted);margin-top:6px}}
+.hub-item{{background:var(--surface2);border-radius:6px;padding:10px;margin-bottom:6px}}
+.hub-bar{{height:4px;background:var(--surface);border-radius:2px;margin:4px 0}}
+.hub-fill{{height:100%;background:var(--blue);border-radius:2px}}
+.path-card{{background:var(--surface2);border-radius:6px;padding:10px;margin-bottom:6px}}
+.quality-item{{padding:3px 0;font-size:12px}}
+.rec-card{{background:var(--surface2);border-radius:8px;padding:12px;margin-bottom:8px}}
+.rec-title{{font-weight:600;font-size:13px;color:var(--text)}}
+.rec-score{{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:700;color:#fff}}
+
 /* 도메인 클러스터 */
 .domain-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}}
 .domain-card{{background:var(--surface2);border-radius:10px;padding:16px;border-left:3px solid var(--purple)}}
@@ -298,6 +468,22 @@ h3{{font-size:15px;margin-bottom:8px;color:var(--green)}}
 
 /* 툴팁 */
 .tooltip{{position:fixed;background:var(--surface);border:1px solid var(--border);padding:10px;border-radius:6px;font-size:12px;pointer-events:none;display:none;z-index:100;max-width:300px;box-shadow:0 4px 12px rgba(0,0,0,.3)}}
+
+/* 해석 패널 */
+.interpretation-toggle{{margin-top:12px;padding:10px 16px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;cursor:pointer;font-size:14px;color:var(--blue);user-select:none;display:flex;align-items:center;gap:6px}}
+.interpretation-toggle:hover{{background:var(--border)}}
+.interpretation-toggle .arrow{{transition:transform .2s;font-size:12px}}
+.interpretation-toggle.open .arrow{{transform:rotate(180deg)}}
+.interpretation-panel{{margin-top:0;background:var(--surface);border:1px solid var(--border);border-top:none;border-radius:0 0 8px 8px;padding:16px;font-size:13px;line-height:1.7;color:var(--text)}}
+.interpretation-panel p{{margin-bottom:8px}}
+.interpretation-panel strong{{color:var(--blue)}}
+.interpretation-panel .section{{margin-bottom:16px}}
+.interpretation-panel .section-title{{font-weight:600;font-size:14px;color:var(--green);margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)}}
+.interpretation-panel .rel-item{{padding:4px 0;display:flex;align-items:center;gap:8px}}
+.interpretation-panel .rel-type{{display:inline-block;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600}}
+.interpretation-panel .rel-type.FK{{background:rgba(248,81,73,.2);color:var(--red)}}
+.interpretation-panel .rel-type.DATA_SIMILAR{{background:rgba(163,113,247,.2);color:var(--purple)}}
+.interpretation-panel .warning{{padding:8px 12px;background:rgba(210,153,34,.1);border-left:3px solid var(--yellow);border-radius:4px;margin:6px 0;font-size:12px;color:var(--yellow)}}
 </style>
 </head>
 <body>
@@ -320,6 +506,7 @@ h3{{font-size:15px;margin-bottom:8px;color:var(--green)}}
     <div class="tab active" onclick="switchTab('graph')">📊 그래프</div>
     <div class="tab" onclick="switchTab('search')">🔍 검색</div>
     <div class="tab" onclick="switchTab('relationships')">🔗 관계</div>
+    <div class="tab" onclick="switchTab('insights')">💡 인사이트</div>
     <div class="tab" onclick="switchTab('domains')">🏷️ 도메인</div>
 </div>
 
@@ -333,6 +520,10 @@ h3{{font-size:15px;margin-bottom:8px;color:var(--green)}}
         <div class="legend-item"><div class="legend-color" style="background:#a371f7"></div>관계</div>
     </div>
     <div id="graph-container"><svg id="graph-svg"></svg></div>
+    <div class="interpretation-toggle" onclick="toggleInterpretation()">
+        <span class="arrow">▾</span> 📋 해석 보기
+    </div>
+    <div id="interpretation-panel" class="interpretation-panel" style="display:none"></div>
 </div>
 
 <!-- 검색 탭 -->
@@ -355,6 +546,11 @@ h3{{font-size:15px;margin-bottom:8px;color:var(--green)}}
     </table>
 </div>
 
+<!-- 인사이트 탭 -->
+<div id="tab-insights" class="panel">
+    <div id="insight-content"></div>
+</div>
+
 <!-- 도메인 탭 -->
 <div id="tab-domains" class="panel">
     <h3>도메인별 클러스터</h3>
@@ -371,6 +567,96 @@ const graphData = {json.dumps(self.graph_data, ensure_ascii=False)};
 // 관계 데이터
 const relData = {json.dumps(overview.get('relationship_distribution', []), ensure_ascii=False)};
 
+// 해석 데이터
+const interpData = {json.dumps(self.data.get_interpretation(), ensure_ascii=False)};
+
+// 해석 토글
+function toggleInterpretation() {{
+    const panel = document.getElementById('interpretation-panel');
+    const toggle = document.querySelector('.interpretation-toggle');
+    if (panel.style.display === 'none') {{
+        panel.style.display = 'block';
+        toggle.classList.add('open');
+        renderInterpretation();
+    }} else {{
+        panel.style.display = 'none';
+        toggle.classList.remove('open');
+    }}
+}}
+
+function renderInterpretation() {{
+    const d = interpData;
+    let html = '';
+
+    // 1. 개요
+    html += `<div class="section">
+        <div class="section-title">📊 개요</div>
+        <p>${{d.summary.description}}</p>
+    </div>`;
+
+    // 2. 스키마별 구성
+    html += `<div class="section">
+        <div class="section-title">🗂️ 스키마별 구성</div>`;
+    for (const s of d.schemas) {{
+        html += `<p><strong>${{s.name}}</strong>: ${{s.tables.join(', ')}}</p>`;
+    }}
+    html += `</div>`;
+
+    // 3. 주요 관계
+    if (d.key_relations.length) {{
+        html += `<div class="section">
+            <div class="section-title">🔗 주요 관계</div>`;
+        for (const r of d.key_relations) {{
+            const cls = r.type === 'FK' ? 'FK' : 'DATA_SIMILAR';
+            html += `<div class="rel-item">
+                <span class="rel-type ${{cls}}">${{r.type}}</span>
+                <span>${{r.source}} → ${{r.target}}</span>
+                <span style="color:var(--muted);font-size:11px">(${{ r.note }})</span>
+            </div>`;
+        }}
+        html += `</div>`;
+    }}
+
+    // 4. 값 기반 탐지
+    if (d.value_based.length) {{
+        html += `<div class="section">
+            <div class="section-title">🔎 값 기반 탐지 결과</div>
+            <p style="color:var(--muted);margin-bottom:6px">
+                FK 제약 없이 실제 데이터 값 중복으로 탐지된 관계입니다. 컬럼명이 달라도 값이 겹치면 연결됩니다.
+            </p>`;
+        const MAX_VB = 10;
+        const shown = d.value_based.slice(0, MAX_VB);
+        for (const v of shown) {{
+            html += `<div class="rel-item">
+                <span class="rel-type DATA_SIMILAR">DATA</span>
+                <span>${{v.source}} → ${{v.target}}</span>
+                <span style="color:var(--muted);font-size:11px">(중복률: ${{v.overlap}})</span>
+            </div>`;
+        }}
+        if (d.value_based.length > MAX_VB) {{
+            html += `<p style="color:var(--muted);font-size:11px;margin-top:4px">
+                ... 외 ${{d.value_based.length - MAX_VB}}개
+            </p>`;
+        }}
+        html += `</div>`;
+    }}
+
+    // 5. 주의사항
+    if (d.warnings.length) {{
+        html += `<div class="section">
+            <div class="section-title">⚠️ 주의사항</div>`;
+        for (const w of d.warnings) {{
+            html += `<div class="warning">${{w}}</div>`;
+        }}
+        html += `<p style="color:var(--muted);font-size:11px;margin-top:6px">
+            위 관계들은 데이터 값만 일치할 뿐 실제 의미상 관련이 없을 수 있습니다.
+            도메인 지식을 바탕으로 검토가 필요합니다.
+        </p></div>`;
+    }}
+
+    document.getElementById('interpretation-panel').innerHTML = html;
+}}
+
 // 탭 전환
 function switchTab(name) {{
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -379,6 +665,7 @@ function switchTab(name) {{
     document.getElementById('tab-' + name).classList.add('active');
     if (name === 'graph') initGraph();
     if (name === 'relationships') renderRelationships();
+    if (name === 'insights') renderInsights();
     if (name === 'domains') renderDomains();
 }}
 
@@ -511,10 +798,153 @@ function renderDomains() {{
     `).join('');
 }}
 
+// 인사이트 데이터
+const insightData = {json.dumps(insight_data, ensure_ascii=False) if insight_data else 'null'};
+
+// 인사이트 렌더링
+function renderInsights() {{
+    if (!insightData) {{
+        document.getElementById('insight-content').innerHTML =
+            '<p style="color:var(--muted);padding:20px;text-align:center">인사이트 엔진이 연결되지 않았습니다.</p>';
+        return;
+    }}
+    let html = '';
+
+    // 2. 비즈니스 엔티티
+    const entities = insightData.entities || [];
+    if (entities.length) {{
+        html += `<div class="section"><div class="section-title">🏢 비즈니스 엔티티</div>
+        <p style="color:var(--muted);margin-bottom:8px">관계 네트워크 기반으로 탐지된 업무 단위입니다.</p>
+        <div class="entity-grid">`;
+        for (const e of entities) {{
+            html += `<div class="entity-card">
+                <div class="entity-name">${{e.name}}</div>
+                <div class="entity-tables">${{e.tables.join(' → ')}}</div>
+                <div class="entity-count">${{e.table_count}}개 테이블</div>
+            </div>`;
+        }}
+        html += `</div></div>`;
+    }}
+
+    // 3. 영향도 (허브 테이블)
+    const hubs = insightData.impactful_tables || [];
+    if (hubs.length) {{
+        html += `<div class="section"><div class="section-title">🎯 영향도 높은 테이블</div>
+        <p style="color:var(--muted);margin-bottom:8px">관계 수가 많아 변경 시 파급력이 큰 테이블입니다.</p>`;
+        for (const h of hubs) {{
+            const bar = Math.min(h.relationship_count * 10, 100);
+            html += `<div class="hub-item">
+                <div style="display:flex;justify-content:space-between;margin-bottom:2px">
+                    <span><strong>${{h.table}}</strong></span>
+                    <span style="color:var(--muted);font-size:11px">${{h.relationship_count}}개 관계</span>
+                </div>
+                <div class="hub-bar"><div class="hub-fill" style="width:${{bar}}%"></div></div>
+                <div style="color:var(--muted);font-size:11px">${{h.description}}</div>
+            </div>`;
+        }}
+        html += `</div>`;
+    }}
+
+    // 1. 조인 경로
+    const paths = insightData.join_paths || [];
+    if (paths.length) {{
+        html += `<div class="section"><div class="section-title">🔗 테이블 간 조인 경로</div>
+        <p style="color:var(--muted);margin-bottom:8px">두 테이블을 연결하는 최단 관계 경로입니다.</p>`;
+        for (const p of paths.slice(0, 8)) {{
+            const firstPath = p.paths[0];
+            if (!firstPath) continue;
+            const steps = firstPath.steps.map(s =>
+                `<span class="path-step">${{s.from}} <span style="color:var(--muted)">→</span> ${{s.to}}</span>`
+            ).join(' <span style="color:var(--muted);font-size:16px">›</span> ');
+            html += `<div class="path-card">
+                <div style="font-size:12px;color:var(--muted);margin-bottom:4px">${{p.source}} ↔ ${{p.target}}</div>
+                <div style="display:flex;flex-wrap:wrap;gap:4px">${{steps}}</div>
+            </div>`;
+        }}
+        if (paths.length > 8) {{
+            html += `<p style="color:var(--muted);font-size:11px;margin-top:4px">... 외 ${{paths.length - 8}}개 경로</p>`;
+        }}
+        html += `</div>`;
+    }}
+
+    // 4. 데이터 품질
+    const quality = insightData.quality || {{}};
+    const q = quality.summary || {{}};
+    html += `<div class="section"><div class="section-title">✅ 데이터 품질</div>`;
+
+    if (quality.missing_fk && quality.missing_fk.length) {{
+        html += `<div style="margin-bottom:8px">
+            <span style="color:var(--yellow);font-weight:600">⚠️ 누락 FK 추천 (${{quality.missing_fk.length}}개)</span>`;
+        for (const fk of quality.missing_fk.slice(0, 5)) {{
+            html += `<div class="quality-item">🔗 <code>${{fk.source}}</code> → <code>${{fk.target}}</code>
+                <span style="color:var(--muted);font-size:11px">(${{Math.round(fk.confidence * 100)}}% 일치)</span></div>`;
+        }}
+        if (quality.missing_fk.length > 5) {{
+            html += `<div style="color:var(--muted);font-size:11px">... 외 ${{quality.missing_fk.length - 5}}개</div>`;
+        }}
+        html += `</div>`;
+    }}
+
+    if (quality.isolated_tables && quality.isolated_tables.length) {{
+        html += `<div style="margin-bottom:8px">
+            <span style="color:var(--red);font-weight:600">🔴 고립 테이블 (${{quality.isolated_tables.length}}개)</span>
+            <div style="color:var(--muted);font-size:12px">${{quality.isolated_tables.join(', ')}}</div>
+        </div>`;
+    }}
+
+    if (quality.hub_tables && quality.hub_tables.length) {{
+        html += `<div style="margin-bottom:8px">
+            <span style="color:var(--blue);font-weight:600">🔵 중심 테이블</span>
+            <div style="font-size:12px;color:var(--text)">${{quality.hub_tables.join(' · ')}}</div>
+        </div>`;
+    }}
+
+    html += `</div>`;
+
+    // 5. 분석 추천
+    const recs = insightData.recommendations || [];
+    if (recs.length) {{
+        html += `<div class="section"><div class="section-title">💡 추천 분석 경로</div>
+        <p style="color:var(--muted);margin-bottom:8px">테이블 간 관계를 활용한 분석 추천입니다.</p>`;
+        for (const r of recs.slice(0, 10)) {{
+            const pct = r.value_score;
+            const barColor = pct >= 80 ? 'var(--green)' : pct >= 60 ? 'var(--yellow)' : 'var(--muted)';
+            let joinHtml = '';
+            for (const j of r.joins) {{
+                joinHtml += `<div style="font-size:11px;color:var(--muted);padding:1px 0">
+                    🔗 <code>${{j.from}}</code> = <code>${{j.to}}</code></div>`;
+            }}
+            let colHtml = '';
+            for (const c of r.result_columns.slice(0, 6)) {{
+                colHtml += `<span style="display:inline-block;background:var(--surface2);padding:1px 6px;border-radius:3px;font-size:10px;margin:1px">${{c.table.split('.')[1]}}.${{c.column}}</span> `;
+            }}
+            if (r.result_columns.length > 6) {{
+                colHtml += `<span style="font-size:10px;color:var(--muted)">+${{r.result_columns.length - 6}}</span>`;
+            }}
+            html += `<div class="rec-card">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+                    <span class="rec-title">${{r.title}}</span>
+                    <span class="rec-score" style="background:${{barColor}}">${{pct}}</span>
+                </div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:4px">📌 ${{r.path}}</div>
+                ${{joinHtml}}
+                <div style="margin-top:4px">${{colHtml}}</div>
+            </div>`;
+        }}
+        if (recs.length > 10) {{
+            html += `<p style="color:var(--muted);font-size:11px;margin-top:4px">... 외 ${{recs.length - 10}}개 추천</p>`;
+        }}
+        html += `</div>`;
+    }}
+
+    document.getElementById('insight-content').innerHTML = html;
+}}
+
 // 초기 로드
 document.addEventListener('DOMContentLoaded', () => {{
     initGraph();
     renderRelationships();
+    renderInsights();
     renderDomains();
 }});
 </script>
