@@ -335,7 +335,7 @@ class DataSimilarityAnalyzer:
                 src_full = f"{rel.source_schema}.{rel.source_table}"
                 tgt_full = f"{rel.target_schema}.{rel.target_table}"
 
-                qi = lambda s: f'"{s.replace("\"", "\"\"")}"'
+                qi = lambda s: '"' + s.replace('"', '""') + '"'
                 src_qi = f"{qi(rel.source_schema)}.{qi(rel.source_table)}"
                 tgt_qi = f"{qi(rel.target_schema)}.{qi(rel.target_table)}"
 

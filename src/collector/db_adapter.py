@@ -163,6 +163,7 @@ class PostgreSQLAdapter(DBAdapter):
                    ) AS table_comment
             FROM information_schema.tables t
             WHERE t.table_schema NOT IN ('pg_catalog', 'information_schema')
+              AND has_schema_privilege(t.table_schema, 'USAGE')
             ORDER BY t.table_schema, t.table_name
         """)
         tables = []
@@ -468,7 +469,9 @@ class MetadataStore:
     def __init__(self, db_path: str = "~/.hermes/data/ontology_metadata.db"):
         self.db_path = os.path.expanduser(db_path)
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
         self._create_tables()
 
     def _create_tables(self):
@@ -544,14 +547,24 @@ class MetadataStore:
         self.conn.commit()
 
     def save_database(self, db_info: DatabaseInfo) -> int:
-        """DB 정보 저장 후 database_id 반환"""
+        """DB 정보 저장 후 database_id 반환 (동일 연결 정보의 DB는 재사용)"""
         cur = self.conn.cursor()
         cur.execute("""
-            INSERT INTO databases (name, db_type, host, port, database_name, description)
-            VALUES (?, ?, ?, ?, ?, ?)
+            SELECT id FROM databases
+            WHERE name=? AND db_type=? AND host=? AND port=? AND database_name=?
         """, (db_info.name, db_info.db_type, db_info.host, db_info.port,
-              db_info.database_name, db_info.description))
-        db_id = cur.lastrowid
+              db_info.database_name))
+        existing = cur.fetchone()
+        if existing:
+            db_id = existing[0]
+            cur.execute("UPDATE databases SET description=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (db_info.description, db_id))
+        else:
+            cur.execute("""
+                INSERT INTO databases (name, db_type, host, port, database_name, description)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (db_info.name, db_info.db_type, db_info.host, db_info.port,
+                  db_info.database_name, db_info.description))
+            db_id = cur.lastrowid
 
         for table in db_info.tables:
             cur.execute("""

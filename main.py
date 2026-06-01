@@ -40,6 +40,7 @@ def fetch_all_tables(host, port, dbname, user, password) -> list[dict]:
                ) AS table_comment
         FROM information_schema.tables t
         WHERE t.table_schema NOT IN ('pg_catalog', 'information_schema')
+          AND has_schema_privilege(t.table_schema, 'USAGE')
         ORDER BY t.table_schema, t.table_name
     """)
     rows = [{"schema": r[0], "table": r[1], "comment": r[2]} for r in cur.fetchall()]

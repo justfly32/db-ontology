@@ -49,6 +49,7 @@ class OntologyGraph:
     def build_from_store(self, store):
         """메타데이터 저장소에서 그래프 구축"""
         self.metadata_store = store
+        self.graph.clear()
         conn = store.conn
 
         # 1. 데이터베이스 노드
