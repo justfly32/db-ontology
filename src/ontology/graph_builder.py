@@ -143,6 +143,7 @@ class OntologyGraph:
                             color=color, size=size,
                             icon="🔑" if is_pk else "🔗" if is_fk else "📌",
                             table=table_name, schema=schema, database=db_name,
+                            table_id=table_id,
                         )
                         self.graph.add_edge(table_node_id, col_node_id,
                             type="HAS_COLUMN", color="#8b949e", width=1,
@@ -334,30 +335,84 @@ class OntologyGraph:
         return {"elements": elements}
 
     def to_d3_json(self) -> dict:
-        """D3.js Force Graph 형식으로 변환"""
+        """D3.js Force Graph 형식으로 변환 (동일 컬럼명은 하나의 노드로 통합)"""
+        from collections import defaultdict
+
         nodes = []
         node_index = {}
+        col_to_field = {}
 
-        for i, (node, attrs) in enumerate(self.graph.nodes(data=True)):
-            node_index[node] = i
+        # 1. FIELD 노드 생성 (COLUMN 그룹핑)
+        field_groups = defaultdict(list)
+        for node, attrs in self.graph.nodes(data=True):
+            if attrs.get("type") == "COLUMN":
+                field_groups[attrs.get("label", node)].append(node)
+
+        for fname, col_nodes in field_groups.items():
+            fid = f"field_{fname}"
+            node_index[fid] = len(nodes)
+            table_names = set()
+            table_ids = set()
+            for cn in col_nodes:
+                ca = self.graph.nodes[cn]
+                if ca.get("table"):
+                    table_names.add(f"{ca.get('database','')}.{ca.get('schema','')}.{ca.get('table','')}")
+                tid = ca.get("table_id")
+                if tid is not None:
+                    table_ids.add(f"table_{tid}")
+                col_to_field[cn] = fid
             nodes.append({
-                "id": node,
-                "name": attrs.get("label", node),
-                "group": attrs.get("type", "UNKNOWN"),
-                "size": attrs.get("size", 15),
-                "color": attrs.get("color", "#8b949e"),
+                "id": fid,
+                "name": fname,
+                "group": "COLUMN",
+                "size": min(50, 10 + len(col_nodes) * 5),
+                "color": "#ffb74d",
+                "table_count": len(col_nodes),
+                "tables": sorted(table_names),
+                "table_ids": sorted(table_ids),
             })
 
+        # 2. 비COLUMN 노드 유지
+        for node, attrs in self.graph.nodes(data=True):
+            if attrs.get("type") != "COLUMN":
+                node_index[node] = len(nodes)
+                nodes.append({
+                    "id": node,
+                    "name": attrs.get("label", node),
+                    "group": attrs.get("type", "UNKNOWN"),
+                    "size": attrs.get("size", 15),
+                    "color": attrs.get("color", "#8b949e"),
+                })
+
+        # 3. 엣지 변환 (COLUMN → FIELD, HAS_COLUMN → HAS_FIELD, 중복 제거)
+        seen_edges = set()
         links = []
         for src, tgt, attrs in self.graph.edges(data=True):
-            if src in node_index and tgt in node_index:
-                links.append({
-                    "source": src,
-                    "target": tgt,
-                    "type": attrs.get("type", ""),
-                    "confidence": attrs.get("confidence", 1.0),
-                    "value": attrs.get("width", 1),
-                })
+            if src not in self.graph or tgt not in self.graph:
+                continue
+            s = col_to_field.get(src, src)
+            t = col_to_field.get(tgt, tgt)
+            if s not in node_index or t not in node_index:
+                continue
+            if s == t:
+                continue
+            etype = attrs.get("type", "")
+            if etype == "HAS_COLUMN":
+                etype = "HAS_FIELD"
+            key = (s, t, etype)
+            if key in seen_edges:
+                continue
+            seen_edges.add(key)
+            link = {
+                "source": s, "target": t,
+                "type": etype,
+                "confidence": attrs.get("confidence", 1.0),
+                "value": attrs.get("width", 1),
+            }
+            notes = attrs.get("notes") or attrs.get("fk_references") or ""
+            if notes:
+                link["notes"] = notes
+            links.append(link)
 
         return {"nodes": nodes, "links": links}
 
